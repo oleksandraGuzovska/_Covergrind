@@ -1,4 +1,5 @@
-##TODO:
+TODO:
+
 1. Clean up hash table functions - Done
 2. Clean up cv_annotate: highlighting 
 3. Automate code annotation: call to cv_annotate to be done behind the scenes
