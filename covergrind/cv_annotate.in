@@ -1,0 +1,688 @@
+#! @PERL@
+
+##--------------------------------------------------------------------##
+##--- Covergrind's annotator.                       cv_annotate.in ---##
+##---A modified version of Cachegrind's annotator                  ---##
+##--------------------------------------------------------------------##
+
+# use warnings;
+# use strict;
+
+#----------------------------------------------------------------------------
+# Global variables, main data structures
+#----------------------------------------------------------------------------
+
+#Comments are from Cachegrind
+
+# Total counts for summary (an array reference).
+my $summary_CC;
+
+# Totals for each function, for overall summary.
+# hash(filename:fn_name => CC array)
+my %fn_totals;
+
+# Individual CCs, organised by filename and line_num for easy annotation.
+# hash(filename => hash(line_num => CC array))
+my %allCCs;
+
+# Files chosen for annotation on the command line.  
+# key = basename (trimmed of any directory), value = full filename
+my %user_ann_files;
+
+# Generic description string.
+my $desc = "";
+
+# Command line of profiled program.
+my $cmd;
+
+# Events in input file, eg. (A,B,C,D)
+my @events;
+
+# Events to show, from command line, eg. (C,A,D)
+my @show_events;
+
+# Map from @show_events indices to @events indices, eg. (2,0,3).  Gives the
+# order in which we must traverse @events in order to show the @show_events, 
+# eg. (@events[$show_order[1]], @events[$show_order[2]]...) = @show_events.
+# (Might help to think of it like a hash (0 => 2, 1 => 0, 2 => 3).)
+my @show_order;
+
+# Print out the function totals sorted by these events, eg. (D,C).
+my @sort_events;
+
+# Map from @sort_events indices to @events indices, eg. (3,2).  Same idea as
+# for @show_order.
+my @sort_order;
+
+# Thresholds, one for each sort event (or default to 1 if no sort events
+# specified).  We print out functions and do auto-annotations until we've
+# handled this proportion of all the events thresholded.
+my @thresholds;
+
+my $default_threshold = 0.1;
+
+my $single_threshold  = $default_threshold;
+
+# If on, show a percentage for each non-zero count.
+my $show_percs = 0;
+
+# If on, automatically annotates all files that are involved in getting over
+# all the threshold counts.
+my $auto_annotate = 0;
+
+# Number of lines to show around each annotated line.
+my $context = 8;
+
+# Directories in which to look for annotation files.
+my @include_dirs = ("");
+
+# Input file name
+my $input_file = undef;
+
+my $exec_src_lines = 0;
+
+my $helper = 1;
+
+my $src_line;
+
+# Usage message.
+my $usage = <<END
+usage: cv_annotate [options] covergrind-out-file [source-files...]                                               
+END
+;
+
+# Used in various places of output.
+my $fancy = '-' x 80 . "\n";
+
+sub safe_div($$)
+{
+    my ($x, $y) = @_;
+    return ($y == 0 ? 0 : $x / $y);
+}
+
+#-----------------------------------------------------------------------------
+# Argument and option handling
+#-----------------------------------------------------------------------------
+sub process_cmd_line() 
+{
+    for my $arg (@ARGV) { 
+        if (not defined $input_file) {
+            # First non-option argument is the output file.
+            $input_file = $arg;
+        } else {
+            # Subsequent non-option arguments are source files.
+            my $readable = 0;
+            foreach my $include_dir (@include_dirs) {
+                if (-r $include_dir . $arg) {
+                    $readable = 1;
+                }
+            }
+            $readable or die("File $arg not found in any of: @include_dirs\n");
+            $user_ann_files{$arg} = 1;
+        }
+    }
+
+    # Must have chosen an input file
+    if (not defined $input_file) {
+        die($usage);
+    }
+}
+
+#-----------------------------------------------------------------------------
+# Reading of input file
+#-----------------------------------------------------------------------------
+sub max ($$) 
+{
+    my ($x, $y) = @_;
+    return ($x > $y ? $x : $y);
+}
+
+# Add the two arrays;  any '.' entries are ignored.  Two tricky things:
+# 1. If $a2->[$i] is undefined, it defaults to 0 which is what we want; we turn
+#    off warnings to allow this.  This makes things about 10% faster than
+#    checking for definedness ourselves.
+# 2. We don't add an undefined count or a ".", even though it's value is 0,
+#    because we don't want to make an $a2->[$i] that is undef become 0
+#    unnecessarily.
+sub add_array_a_to_b ($$) 
+{
+    my ($a1, $a2) = @_;
+
+    my $n = max(scalar @$a1, scalar @$a2);
+    $^W = 0;
+    foreach my $i (0 .. $n-1) {
+        $a2->[$i] += $a1->[$i] if (defined $a1->[$i] && "." ne $a1->[$i]);
+    }
+    $^W = 1;
+}
+
+# Add each event count to the CC array.  '.' counts become undef, as do
+# missing entries (implicitly).
+sub line_to_CC ($)
+{
+    my @CC = (split /\s+/, $_[0]);
+    # (@CC <= @events) or die("Line $.: too many event counts\n");
+    return \@CC;
+}
+
+sub read_input_file() 
+{
+    open(INPUTFILE, "< $input_file") 
+         || die "Cannot open $input_file for reading\n";
+
+    # Read "desc:" lines.
+    my $line;
+    while ($line = <INPUTFILE>) {
+        if ($line =~ s/desc:\s+//) {
+            $desc .= $line;
+        } else {
+            last;
+        }
+    }
+
+    # Read "cmd:" line (Nb: will already be in $line from "desc:" loop above).
+    ($line =~ s/^cmd:\s+//) or die("Line $.: missing command line\n");
+    $cmd = $line;
+    chomp($cmd);    # Remove newline
+
+    # Read "events:" line.  We make a temporary hash in which the Nth event's
+    # value is N, which is useful for handling --show/--sort options below.
+    $line = <INPUTFILE>;
+    (defined $line && $line =~ s/^events:\s+//) 
+        or die("Line $.: missing events line\n");
+    @events = split(/\s+/, $line);
+    my %events;
+    my $n = 0;
+    foreach my $event (@events) {
+        $events{$event} = $n;
+        $n++
+    }
+
+    # If no --show arg give, default to showing all events in the file.
+    # If --show option is used, check all specified events appeared in the
+    # "events:" line.  Then initialise @show_order.
+    if (@show_events) {
+        foreach my $show_event (@show_events) {
+            (defined $events{$show_event}) or 
+                die("--show event `$show_event' did not appear in input\n");
+        }
+    } else {
+        @show_events = @events;
+    }
+    foreach my $show_event (@show_events) {
+        push(@show_order, $events{$show_event});
+    }
+
+    # Do as for --show, but if no --sort arg given, default to sorting by
+    # column order (ie. first column event is primary sort key, 2nd column is
+    # 2ndary key, etc).
+    if (@sort_events) {
+        foreach my $sort_event (@sort_events) {
+            (defined $events{$sort_event}) or 
+                die("--sort event `$sort_event' did not appear in input\n");
+        }
+    } else {
+        @sort_events = @events;
+    }
+    foreach my $sort_event (@sort_events) {
+        push(@sort_order, $events{$sort_event});
+    }
+
+    # If multiple threshold args weren't given via --sort, stick in the single
+    # threshold (either from --threshold if used, or the default otherwise) for
+    # the primary sort event, and 0% for the rest.
+    if (not @thresholds) {
+        foreach my $e (@sort_order) {
+            push(@thresholds, 100);
+        }
+        $thresholds[0] = $single_threshold;
+    }
+
+    my $currFileName;
+    my $currFileFuncName;
+
+    my $currFuncCC;
+    my $currFileCCs = {};     # hash(line_num => CC)
+
+    # Read body of input file.
+    while (<INPUTFILE>) {
+        s/#.*$//;   # remove comments
+        if (s/^(-?\d+)\s+//) {
+            my $lineNum = $1;
+            my $CC = line_to_CC($_);
+            defined($currFuncCC) || die;
+            add_array_a_to_b($CC, $currFuncCC);
+            
+            # If currFileName is selected, add CC to currFileName list.  We look for
+            # full filename matches;  or, if auto-annotating, we have to
+            # remember everything -- we won't know until the end what's needed.
+            defined($currFileCCs) || die;
+            if ($auto_annotate || defined $user_ann_files{$currFileName}) {
+                my $currLineCC = $currFileCCs->{$lineNum};
+                if (not defined $currLineCC) {
+                    $currLineCC = [];
+                    $currFileCCs->{$lineNum} = $currLineCC;
+                }
+                add_array_a_to_b($CC, $currLineCC);
+            }
+
+        } elsif (s/^fn=(.*)$//) {
+            $currFileFuncName = "$currFileName:$1";
+            $currFuncCC = $fn_totals{$currFileFuncName};
+            if (not defined $currFuncCC) {
+                $currFuncCC = [];
+                $fn_totals{$currFileFuncName} = $currFuncCC;
+            }
+
+        } elsif (s/^fl=(.*)$//) {
+            $currFileName = $1;
+            $currFileCCs = $allCCs{$currFileName};
+            if (not defined $currFileCCs) {
+                $currFileCCs = {};
+                $allCCs{$currFileName} = $currFileCCs;
+            }
+            # Assume that a "fn=" line is followed by a "fl=" line.
+            $currFileFuncName = undef;
+
+        } elsif (s/^\s*$//) {
+            # blank, do nothing
+        
+        } elsif (s/^summary:\s+//) {
+            $summary_CC = line_to_CC($_);
+            # (scalar(@$summary_CC) == @events) 
+            #     or die("Line $.: summary event and total event mismatch\n");
+
+        } else {
+            warn("WARNING: line $. malformed, ignoring\n");
+        }
+    }
+
+    # Check if summary line was present
+    if (not defined $summary_CC) {
+        die("missing final summary line, aborting\n");
+    }
+
+    close(INPUTFILE);
+}
+
+sub commify ($) {
+    my ($val) = @_;
+    1 while ($val =~ s/^(-?\d+)(\d{3})/$1,$2/);
+    return $val;
+}
+
+# Because the counts can get very big, and we don't want to waste screen space
+# and make lines too long, we compute exactly how wide each column needs to be
+# by finding the widest entry for each one.
+sub compute_CC_col_widths (@) 
+{
+    my @CCs = @_;
+    my $CC_col_widths = [];
+
+    # Initialise with minimum widths (from event names)
+    foreach my $event (@events) {
+        push(@$CC_col_widths, length($event));
+    }
+    
+    # Find maximum width count for each column.  @CC_col_width positions
+    # correspond to @CC positions.
+    foreach my $CC (@CCs) {
+        foreach my $i (0 .. scalar(@$CC)-1) {
+            if (defined $CC->[$i]) {
+                # Find length, accounting for commas that will be added, and
+                # possibly a percentage.
+                my $length = length $CC->[$i];
+                my $width = $length + int(($length - 1) / 3);
+                if ($show_percs) {
+                    $width += 9;    # e.g. " (12.34%)" is 9 chars
+                }
+                $CC_col_widths->[$i] = max($CC_col_widths->[$i], $width); 
+            }
+        }
+    }
+    return $CC_col_widths;
+}
+
+# Print the CC with each column's size dictated by $CC_col_widths.
+sub print_CC ($$$) 
+{
+    my ($CC, $CC_col_widths, $src_line) = @_;
+    my $trimmed = "";
+
+    $trimmed = trim($src_line);
+
+    foreach my $i (@show_order) {
+
+        my $count = ((defined $CC->[$i] && $CC->[$i] > 0 && $trimmed ne "{" && $trimmed ne "}") ? commify($CC->[$i]) : ".");
+
+        # print("\n***$count\n");
+
+        if ($count ne "." && $helper == 1) {
+            # print("\n***$count****\n");
+            $exec_src_lines++;
+        }
+
+        my $perc = "";
+        if ($show_percs) {
+            if (defined $CC->[$i] && $CC->[$i] != 0) {
+                # Try our best to keep the number fitting into 5 chars. This
+                # requires dropping a digit after the decimal place if it's
+                # sufficiently negative (e.g. "-10.0") or positive (e.g.
+                # "100.0"). Thanks to diffs it's possible to have even more
+                # extreme values, like "-100.0" or "1000.0"; those rare case
+                # will end up with slightly wrong indenting, oh well.
+                $perc = safe_div($CC->[$i] * 100, $summary_CC->[$i]);
+                $perc = (-9.995 < $perc && $perc < 99.995)
+                      ? sprintf(" (%5.2f%%)", $perc)
+                      : sprintf(" (%5.1f%%)", $perc);
+            } else {
+                # Don't show percentages for "." and "0" entries.
+                $perc = "         ";
+            }
+        }
+
+        # $reps will be negative for the extreme values mentioned above. The
+        # use of max() avoids a possible warning about a negative repeat count.
+        my $text = $count . $perc;
+        my $len = length($text);
+        my $reps = $CC_col_widths->[$i] - length($text);
+        my $space = ' ' x max($reps, 0);
+        print ("$space$text ");
+    }
+}
+
+sub print_events ($)
+{
+    my ($CC_col_widths) = @_;
+
+    foreach my $i (@show_order) { 
+        my $event       = $events[$i];
+        my $event_width = length($event);
+        my $col_width   = $CC_col_widths->[$i];
+        my $space       = ' ' x ($col_width - $event_width);
+        print ("$event$space ");
+    }
+}
+
+#-----------------------------------------------------------------------------
+# Annotate selected files
+#-----------------------------------------------------------------------------
+
+# Issue a warning that the source file is more recent than the input file. 
+sub warning_on_src_more_recent_than_inputfile ($)
+{
+    my $src_file = $_[0];
+
+    my $warning = <<END
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ Source file '$src_file' is more recent than input file '$input_file'.
+@ Annotations may not be correct.
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+END
+;
+    print($warning);
+}
+
+# If there is information about lines not in the file, issue a warning
+# explaining possible causes.
+sub warning_on_nonexistent_lines ($$$)
+{
+    my ($src_more_recent_than_inputfile, $src_file, $excess_line_nums) = @_;
+    my $cause_and_solution;
+
+    if ($src_more_recent_than_inputfile) {
+        $cause_and_solution = <<END
+@@ cause:    '$src_file' has changed since information was gathered.
+@@           If so, a warning will have already been issued about this.
+@@ solution: Recompile program and rerun under "valgrind --cachesim=yes" to 
+@@           gather new information.
+END
+    # We suppress warnings about .h files
+    } elsif ($src_file =~ /\.h$/) {
+        $cause_and_solution = <<END
+@@ cause:    bug in the Valgrind's debug info reader that screws up with .h
+@@           files sometimes
+@@ solution: none, sorry
+END
+    } else {
+        $cause_and_solution = <<END
+@@ cause:    not sure, sorry
+END
+    }
+
+    my $warning = <<END
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@
+@@ Information recorded about lines past the end of '$src_file'.
+@@
+@@ Probable cause and solution:
+$cause_and_solution@@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+END
+;
+    print($warning);
+}
+
+sub annotate_ann_files($)
+{
+    use Term::ANSIColor qw(:constants);
+    use String::Util qw(trim);
+
+    my ($threshold_files) = @_; 
+
+    my %all_ann_files;
+    my @unfound_auto_annotate_files;
+    my $printed_totals_CC = [];
+    my $src_line_num = 1;
+
+    my $trimmed;
+    my $not_exec = 0;
+    my $first_char;
+    # my $src_line = "";
+    my $not_executed_src_lines = 0;
+
+    # If auto-annotating, add interesting files (but not "???")
+    if ($auto_annotate) {
+        delete $threshold_files->{"???"};
+        %all_ann_files = (%user_ann_files, %$threshold_files) 
+    } else {
+        %all_ann_files = %user_ann_files;
+    }
+
+    # Track if we did any annotations.
+    my $did_annotations = 0;
+
+    LOOP:
+    foreach my $src_file (keys %all_ann_files) {
+
+        my $opened_file = "";
+        my $full_file_name = "";
+        # Nb: include_dirs already includes "", so it works in the case
+        # where the filename has the full path.
+        foreach my $include_dir (@include_dirs) {
+            my $try_name = $include_dir . $src_file;
+            if (open(INPUTFILE, "< $try_name")) {
+                $opened_file    = $try_name;
+                $full_file_name = ($include_dir eq "" 
+                                  ? $src_file 
+                                  : "$include_dir + $src_file"); 
+                last;
+            }
+        }
+        
+        if (not $opened_file) {
+            # Failed to open the file.  If chosen on the command line, die.
+            # If arose from auto-annotation, print a little message.
+            if (defined $user_ann_files{$src_file}) {
+                die("File $src_file not opened in any of: @include_dirs\n");
+
+            } else {
+                push(@unfound_auto_annotate_files, $src_file);
+            }
+
+        } else {
+            # File header (distinguish between user- and auto-selected files).
+            print("$fancy");
+            my $ann_type = 
+                (defined $user_ann_files{$src_file} ? "User" : "Auto");
+            print("-- $ann_type-annotated source: $full_file_name\n");
+            print("$fancy");
+
+            # Get file's CCs
+            my $src_file_CCs = $allCCs{$src_file};
+            if (!defined $src_file_CCs) {
+                print("  No information has been collected for $src_file\n\n");
+                next LOOP;
+            }
+        
+            $did_annotations = 1;
+            
+            # Numeric, not lexicographic sort!
+            my @line_nums = sort {$a <=> $b} keys %$src_file_CCs;  
+
+            # If $src_file more recent than covergrind.out, issue warning
+            my $src_more_recent_than_inputfile = 0;
+            if ((stat $opened_file)[9] > (stat $input_file)[9]) {
+                $src_more_recent_than_inputfile = 1;
+                warning_on_src_more_recent_than_inputfile($src_file);
+            }
+
+            # Work out the size of each column for printing
+            my $CC_col_widths = compute_CC_col_widths(values %$src_file_CCs);
+
+            # Events header
+            print_events($CC_col_widths);
+            print("\n\n");
+
+            # Shift out 0 if it's in the line numbers (from unknown entries,
+            # likely due to bugs in Valgrind's stabs debug info reader)
+            shift(@line_nums) if (0 == $line_nums[0]);
+
+            # Finds interesting line ranges -- all lines with a CC, and all
+            # lines within $context lines of a line with a CC.
+            my $n = @line_nums;
+            my @pairs;
+            for (my $i = 0; $i < $n; $i++) {
+                push(@pairs, $line_nums[$i] - $context);   # lower marker
+                while ($i < $n-1 && 
+                       $line_nums[$i] + 2*$context >= $line_nums[$i+1]) {
+                    $i++;
+                }
+                push(@pairs, $line_nums[$i] + $context);   # upper marker
+            }
+
+            # Annotate chosen lines, tracking total counts of lines printed
+            $pairs[0] = 1 if ($pairs[0] < 1);
+            while (@pairs) {
+                my $low  = shift @pairs;
+                my $high = shift @pairs;
+                while ($. < $low-1) {
+                    my $tmp = <INPUTFILE>;
+                    last unless (defined $tmp);     # hack to detect EOF
+                }
+                # my $src_line;
+                # Print line number, unless start of file
+                # print("-- line $low " . '-' x 40 . "\n") if ($low != 1);
+                while (($. < $high) && ($src_line = <INPUTFILE>)) {
+                    if (defined $line_nums[0] && $. == $line_nums[0]) {
+                        print_CC($src_file_CCs->{$.}, $CC_col_widths, $src_line);
+                        add_array_a_to_b($src_file_CCs->{$.}, 
+                                         $printed_totals_CC);
+                        shift(@line_nums);
+
+                    } else {
+                        print_CC([], $CC_col_widths, $src_line);
+                        $not_exec = 1;
+                        # print(" entered here ");
+                    }
+                    print("   $src_line_num: ");
+
+                    $trimmed = trim($src_line);
+                    $first_char = substr $trimmed, 0, 1;
+
+                    if ($first_char eq "/") {
+                        print (" $src_line");
+                        $not_exec = 0;
+                    }
+
+                    elsif ($not_exec == 1 && $first_char ne "#" && $trimmed ne "}" && $trimmed ne "{" ) {
+                        print RED, (" $src_line"), RESET;
+                        $not_exec = 0;
+                        
+                        if ($src_line ne "" && $first_char ne "#") {
+                            $not_executed_src_lines++;
+                        }
+                        
+                    } else {
+                        print (" $src_line");
+                        $not_exec = 0;
+                    }
+                    # }
+
+                    $src_line_num++;
+                }
+                # Print line number, unless EOF
+                if ($src_line) {
+                    print("-- line $high " . '-' x 40 . "\n");
+                } else {
+                    last;
+                }
+            }
+
+            # If there was info on lines past the end of the file...
+            if (@line_nums) {
+                foreach my $line_num (@line_nums) {
+                    print_CC($src_file_CCs->{$line_num}, $CC_col_widths, $src_line);
+                    print(" <bogus line $line_num>\n");
+                }
+                print("\n");
+                warning_on_nonexistent_lines($src_more_recent_than_inputfile,
+                                             $src_file, \@line_nums);
+            }
+            print("\n");
+
+            # Print summary of counts attributed to file but not to any
+            # particular line (due to incomplete debug info).
+            if ($src_file_CCs->{0}) {
+                print_CC($src_file_CCs->{0}, $CC_col_widths, $src_line);
+                print(" <counts for unidentified lines in $src_file>\n\n");
+            }
+            
+            close(INPUTFILE);
+        }
+    }
+
+    # If we did any annotating, show how many events were covered by annotated
+    # lines above.
+    if ($did_annotations) {
+        my $CC_col_widths = compute_CC_col_widths($printed_totals_CC);
+        print($fancy);
+        # print_events($CC_col_widths);
+        # print("\n");
+        # print($fancy);
+        $helper = 0;
+        # print_CC($printed_totals_CC, $CC_col_widths, $src_line);
+        # print(" events annotated\n\n");
+
+        my $total_src_lines = $exec_src_lines;
+        # print("Total lines of code: $total_src_lines\n");
+
+    }
+}
+
+#----------------------------------------------------------------------------
+# "main()"
+#----------------------------------------------------------------------------
+process_cmd_line();
+read_input_file();
+my $threshold_files       = {};
+annotate_ann_files($threshold_files);
+
+##--------------------------------------------------------------------##
+##--- end                                           cv_annotate.in ---##
+##--------------------------------------------------------------------##

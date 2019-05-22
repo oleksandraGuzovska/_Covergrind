@@ -1,0 +1,10 @@
+##TODO:
+1. Clean up hash table functions - Done
+2. Clean up cv_annotate: highlighting 
+3. Automate code annotation: call to cv_annotate to be done behind the scenes
+4. Clean up cv_main.c
+5. Show how many times a line of code was executed
+6. Work on function call graph
+7. Display program stats
+8. cv_annotate: make it work with any number of input files - Done
+9. cv_annotate: fix colored text display in text files
