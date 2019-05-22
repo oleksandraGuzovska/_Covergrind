@@ -1,4 +1,5 @@
-# Covergrind - a code coverage tool for Linux programs (modified Cachegrind). The tool reports executed lines, branches, and number of calls to each function; highlights lines of code that never run. </br>
+# Covergrind - a code coverage tool for Linux programs (modified Cachegrind).
+The tool reports executed lines, branches, and number of calls to each function; highlights lines of code that never ran. </br>
 Framework: open source dynamic binary instrumentation framework Valgrind.
 
 ## Installation:
